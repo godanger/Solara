@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = "https://music-api.gdstudio.xyz/api.php";
+const DEFAULT_API_BASE_URL = "https://api.moeyao.cn/meting/";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
 
@@ -85,18 +85,16 @@ async function proxyKuwoAudio(targetUrl: string, request: Request): Promise<Resp
 
 async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void, apiBaseUrl: string = DEFAULT_API_BASE_URL): Promise<Response> {
   const cache = caches.default;
-  
-  // 构建缓存 Key（过滤掉随机签名 s 以及强制刷新标记 nocache，以便重试成功后能更新同一个缓存项）
+
   const cacheUrl = new URL(url.toString());
   cacheUrl.searchParams.delete("s");
   cacheUrl.searchParams.delete("nocache");
-  
+
   const cacheKey = new Request(cacheUrl.toString(), {
     method: request.method,
     headers: request.headers
   });
 
-  // 如果是 GET 请求且未指定 nocache 强制刷新，尝试命中缓存
   const bypassCache = url.searchParams.get("nocache") === "true";
   if (request.method === "GET" && !bypassCache) {
     try {
@@ -115,15 +113,46 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   console.log(`[Cache MISS] Fetching from upstream: ${url.toString()}`);
 
-  const apiUrl = new URL(apiBaseUrl);
-  url.searchParams.forEach((value, key) => {
-    if (key === "target" || key === "callback" || key === "s" || key === "nocache") {
-      return;
-    }
-    apiUrl.searchParams.set(key, value);
-  });
+  // ---- Solara 参数 -> moeyao/Meting 参数映射 ----
+  const solaraTypes = url.searchParams.get("types") || "";
+  const solaraSource = url.searchParams.get("source") || "netease";
+  const solaraName = url.searchParams.get("name");
+  const solaraId = url.searchParams.get("id");
 
-  if (!apiUrl.searchParams.has("types")) {
+  const typeMap: Record<string, string> = {
+    "search": "search",
+    "url": "url",
+    "pic": "cover",
+    "lyric": "lrc",
+    "playlist": "playlist",
+    "song": "single",
+  };
+
+  const sourceMap: Record<string, string> = {
+    "netease": "netease",
+    "tencent": "tencent",
+    "qq": "tencent",
+  };
+  const metingServer = sourceMap[solaraSource] || "netease";
+  const metingType = typeMap[solaraTypes] || solaraTypes;
+
+  if (metingType === "search" && !solaraName) {
+    return new Response("Missing search keyword", { status: 400 });
+  }
+
+  const apiUrl = new URL(apiBaseUrl);
+  apiUrl.searchParams.set("server", metingServer);
+  apiUrl.searchParams.set("type", metingType);
+  apiUrl.searchParams.set("id", solaraName || solaraId || "");
+
+  const count = url.searchParams.get("count");
+  const pages = url.searchParams.get("pages");
+  const br = url.searchParams.get("br");
+  if (count) apiUrl.searchParams.set("count", count);
+  if (pages) apiUrl.searchParams.set("pages", pages);
+  if (br) apiUrl.searchParams.set("br", br);
+
+  if (!apiUrl.searchParams.has("type")) {
     return new Response("Missing types", { status: 400 });
   }
 
@@ -134,23 +163,62 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     },
   });
 
-  const responseText = await upstream.text();
+  let responseText = await upstream.text();
   const headers = createCorsHeaders(upstream.headers);
   if (!headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json; charset=utf-8");
   }
-
   headers.set("X-Cache-Status", "MISS");
   headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
 
-  // 判断是否应该缓存：必须是 200 状态，且内容不能是空数组或包含错误标识，且未指定强制刷新
-  const isSearch = url.searchParams.get("types") === "search";
-  const isEmptyResult = responseText.trim() === "[]";
-  const isError = responseText.includes('"error"') || responseText.includes('"status":0');
-  
+  // 清理 PHP 弃用警告（可能出现在 JSON 之前的 HTML 标签）
+  if (responseText.includes("<b>Deprecated</b>") || responseText.includes("<br />")) {
+    const firstJsonChar = responseText.search(/[\[{]/);
+    if (firstJsonChar > 0) {
+      responseText = responseText.slice(firstJsonChar);
+    }
+  }
+
+  // ---- type=url：moeyao 返回的是纯文本文件名，需要补全为完整 URL ----
+  if (metingType === "url" && upstream.status === 200) {
+    const trimmed = responseText.trim();
+    const isPlainPath = trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("http");
+    if (isPlainPath) {
+      // moeyao 的 url 接口返回的是相对路径文件名（如 035d/555d/...mp3）
+      // 实际音频 CDN 前缀需要根据其接口行为确认；先原样返回，让前端 audio.js 的候选地址逻辑处理
+      // 如果前端直接播放失败，可在此处拼接真实 CDN 前缀
+      responseText = JSON.stringify({ url: trimmed });
+    }
+  }
+
+  // ---- 雷达歌单格式转换：moeyao 扁平数组 -> 网易云 {playlist:{tracks:[...]}} ----
+  if (metingType === "playlist" && upstream.status === 200) {
+    try {
+      const parsed = JSON.parse(responseText);
+      if (Array.isArray(parsed)) {
+        const tracks = parsed.map((item: any, idx: number) => ({
+          id: item.id || item.songmid || `radar_${idx}`,
+          name: item.name || item.title || "未知歌曲",
+          ar: [{ name: item.artist || item.author || "未知艺术家" }],
+          al: {
+            name: item.album || "",
+            picUrl: item.cover || item.pic || "",
+            pic_str: item.pic_id || "",
+          },
+        }));
+        responseText = JSON.stringify({ playlist: { tracks } });
+      }
+    } catch (e) {
+      console.warn("[Radar] playlist 格式转换失败", e);
+    }
+  }
+
+  const isSearch = metingType === "search";
+  const isEmptyResult = responseText.trim() === "[]" || responseText.trim() === "";
+  const isError = responseText.includes('"error"') || responseText.includes('"status":400') || responseText.includes('"status":403');
+
   let shouldCache = upstream.status === 200 && request.method === "GET" && !isError && !bypassCache;
-  
-  // 如果是搜索请求且结果为空，通常是 API 繁忙或异常，不建议长缓存
+
   if (isSearch && isEmptyResult) {
     shouldCache = false;
   }
@@ -167,7 +235,6 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     headers,
   });
 
-  // 写入缓存（不阻塞主流程）
   if (shouldCache && waitUntil) {
     waitUntil(cache.put(cacheKey, response.clone()));
     console.log(`[Cache PUT] Saved to cache: ${url.toString()}`);
@@ -177,7 +244,6 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 }
 
 export async function onRequest({ request, waitUntil, env }: { request: Request, waitUntil: (promise: Promise<any>) => void, env: any }): Promise<Response> {
-  // 优先使用环境变量中配置的 API 地址，CF 部署未设置时 fallback 到默认节点
   const apiBaseUrl = (typeof env?.API_BASE_URL === "string" && env.API_BASE_URL) ? env.API_BASE_URL : DEFAULT_API_BASE_URL;
   if (request.method === "OPTIONS") {
     return handleOptions();
