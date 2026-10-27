@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = "https://met.liiiu.cn/meting/api";
+const DEFAULT_API_BASE_URL = "https://api.moeyao.cn/meting/";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
 
@@ -113,7 +113,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   console.log(`[Cache MISS] Fetching from upstream: ${url.toString()}`);
 
-  // ---- Solara 参数 -> met.liiiu.cn 参数映射 ----
+  // ---- Solara 参数 -> moeyao/Meting 参数映射 ----
   const solaraTypes = url.searchParams.get("types") || "";
   const solaraSource = url.searchParams.get("source") || "netease";
   const solaraName = url.searchParams.get("name");
@@ -122,10 +122,10 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   const typeMap: Record<string, string> = {
     "search": "search",
     "url": "url",
-    "pic": "pic",
+    "pic": "cover",
     "lyric": "lrc",
     "playlist": "playlist",
-    "song": "song",
+    "song": "single",
   };
 
   const sourceMap: Record<string, string> = {
@@ -140,16 +140,6 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     return new Response("Missing search keyword", { status: 400 });
   }
 
-  if (metingServer === "tencent" && metingType === "search") {
-    return new Response(JSON.stringify({ error: "tencent source does not support search" }), {
-      status: 400,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
-      },
-    });
-  }
-
   const apiUrl = new URL(apiBaseUrl);
   apiUrl.searchParams.set("server", metingServer);
   apiUrl.searchParams.set("type", metingType);
@@ -158,14 +148,36 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   const count = url.searchParams.get("count");
   const pages = url.searchParams.get("pages");
   const br = url.searchParams.get("br");
-  const size = url.searchParams.get("size");
   if (count) apiUrl.searchParams.set("count", count);
   if (pages) apiUrl.searchParams.set("pages", pages);
   if (br) apiUrl.searchParams.set("br", br);
-  if (size) apiUrl.searchParams.set("size", size);
 
   if (!apiUrl.searchParams.has("type")) {
     return new Response("Missing types", { status: 400 });
+  }
+
+  // ---- type=lrc：纯文本 LRC 包装成前端期望的 JSON ----
+  if (metingType === "lrc") {
+    const lyricUpstream = await fetch(apiUrl.toString(), {
+      headers: {
+        "User-Agent": "Meting/1.5.0",
+        "Accept": "application/json",
+      },
+    });
+    const lyricText = (await lyricUpstream.text()).trim();
+    const payload = lyricText.startsWith("{")
+      ? lyricText
+      : JSON.stringify({ lyric: lyricText, tlyric: "" });
+    return new Response(payload, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "X-Cache-Status": "MISS",
+        "Access-Control-Expose-Headers": "X-Cache-Status",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      },
+    });
   }
 
   const upstream = await fetch(apiUrl.toString(), {
@@ -183,56 +195,30 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   headers.set("X-Cache-Status", "MISS");
   headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
 
-  // ---- type=url：跟随重定向，从 Response.url 拿最终 CDN 直链 ----
-  if (metingType === "url" && upstream.status === 200) {
-    const trimmed = responseText.trim();
-    let finalUrl: string | null = null;
-
-    if (trimmed.startsWith("{")) {
-      try {
-        const json = JSON.parse(trimmed);
-        if (json.url) {
-          const followResp = await fetch(json.url, {
-            headers: { "User-Agent": "Meting/1.5.0" },
-            redirect: "follow",
-          });
-          finalUrl = followResp.url || json.url;
-        }
-      } catch {}
-    } else if (trimmed.startsWith("http")) {
-      const followResp = await fetch(trimmed, {
-        headers: { "User-Agent": "Meting/1.5.0" },
-        redirect: "follow",
-      });
-      finalUrl = followResp.url || trimmed;
-    } else if (trimmed && !trimmed.startsWith("[")) {
-      finalUrl = trimmed.startsWith("/")
-        ? new URL(apiBaseUrl).origin + trimmed
-        : apiBaseUrl.replace(/\/$/, "") + "/" + trimmed;
-    }
-
-    if (finalUrl) {
-      responseText = JSON.stringify({ url: finalUrl });
-    } else {
-      responseText = JSON.stringify({ url: trimmed });
+  // 清理 PHP 弃用警告（可能出现在 JSON 之前的 HTML 标签）
+  if (responseText.includes("<b>Deprecated</b>") || responseText.includes("<br />")) {
+    const firstJsonChar = responseText.search(/[\[{]/);
+    if (firstJsonChar > 0) {
+      responseText = responseText.slice(firstJsonChar);
     }
   }
 
-  // ---- type=lrc：纯文本 LRC 包装成前端期望的 JSON ----
-  if (metingType === "lrc" && upstream.status === 200) {
-    const trimmed = responseText.trim();
-    if (trimmed && !trimmed.startsWith("{")) {
-      responseText = JSON.stringify({ lyric: trimmed, tlyric: "" });
-    }
-  }
-
-  // ---- 雷达歌单格式转换：扁平数组 -> 网易云 {playlist:{tracks:[...]}} ----
+  // ---- 雷达歌单格式转换：moeyao 扁平数组 -> 网易云 {playlist:{tracks:[...]}} ----
+  // moeyao 的 playlist 返回项只有 name/artist/cover，真实歌曲 ID 藏在 cover 的查询参数里
   if (metingType === "playlist" && upstream.status === 200) {
     try {
       const parsed = JSON.parse(responseText);
       if (Array.isArray(parsed)) {
         const tracks = parsed.map((item: any, idx: number) => {
-          let realId = item.id || item.songmid || item.song_id || "";
+          let realId = item.id || item.songmid || "";
+          // 优先从 cover 字段解析 id
+          if (!realId && typeof item.cover === "string") {
+            try {
+              const u = new URL(item.cover);
+              realId = u.searchParams.get("id") || "";
+            } catch {}
+          }
+          // 兜底：从 url / lrc 字段解析
           if (!realId && typeof item.url === "string") {
             try {
               const u = new URL(item.url);
@@ -251,7 +237,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
             ar: [{ name: item.artist || item.author || "未知艺术家" }],
             al: {
               name: item.album || "",
-              picUrl: item.pic || item.cover || "",
+              picUrl: item.cover || item.pic || "",
               pic_str: item.pic_id || "",
             },
           };
