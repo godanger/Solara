@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = "https://api.moeyao.cn/meting/";
+const DEFAULT_API_BASE_URL = "https://met.liiiu.cn/meting/api";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
 
