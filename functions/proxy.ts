@@ -156,18 +156,31 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     return new Response("Missing types", { status: 400 });
   }
 
-  // ---- type=lrc：纯文本 LRC 包装成前端期望的 JSON ----
-  if (metingType === "lrc") {
-    const lyricUpstream = await fetch(apiUrl.toString(), {
+  // ---- type=url：不跟随重定向，直接提取 302 Location 作为完整播放地址 ----
+  if (metingType === "url") {
+    const urlUpstream = await fetch(apiUrl.toString(), {
       headers: {
         "User-Agent": "Meting/1.5.0",
         "Accept": "application/json",
       },
+      redirect: "manual",
     });
-    const lyricText = (await lyricUpstream.text()).trim();
-    const payload = lyricText.startsWith("{")
-      ? lyricText
-      : JSON.stringify({ lyric: lyricText, tlyric: "" });
+
+    const location = urlUpstream.headers.get("Location");
+    let payload: string;
+
+    if (location) {
+      payload = JSON.stringify({ url: location });
+    } else {
+      const bodyText = await urlUpstream.text();
+      const trimmed = bodyText.trim();
+      if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+        payload = JSON.stringify({ url: trimmed });
+      } else {
+        payload = bodyText;
+      }
+    }
+
     return new Response(payload, {
       status: 200,
       headers: {
