@@ -156,6 +156,43 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     return new Response("Missing types", { status: 400 });
   }
 
+  // ---- type=url：不跟随重定向，直接提取 302 Location 作为完整播放地址 ----
+  if (metingType === "url") {
+    const urlUpstream = await fetch(apiUrl.toString(), {
+      headers: {
+        "User-Agent": "Meting/1.5.0",
+        "Accept": "application/json",
+      },
+      redirect: "manual",
+    });
+
+    const location = urlUpstream.headers.get("Location");
+    let payload: string;
+
+    if (location) {
+      payload = JSON.stringify({ url: location });
+    } else {
+      const bodyText = await urlUpstream.text();
+      const trimmed = bodyText.trim();
+      if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+        payload = JSON.stringify({ url: trimmed });
+      } else {
+        payload = bodyText;
+      }
+    }
+
+    return new Response(payload, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "X-Cache-Status": "MISS",
+        "Access-Control-Expose-Headers": "X-Cache-Status",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      },
+    });
+  }
+
   const upstream = await fetch(apiUrl.toString(), {
     headers: {
       "User-Agent": "Meting/1.5.0",
@@ -176,20 +213,6 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     const firstJsonChar = responseText.search(/[\[{]/);
     if (firstJsonChar > 0) {
       responseText = responseText.slice(firstJsonChar);
-    }
-  }
-
-  // ---- type=url：无论上游返回完整 URL 还是相对路径，统一包装成 {"url": "..."} ----
-  if (metingType === "url" && upstream.status === 200) {
-    const trimmed = responseText.trim();
-    if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-      let finalUrl = trimmed;
-      if (!trimmed.startsWith("http")) {
-        finalUrl = trimmed.startsWith("/")
-          ? `https://api.moeyao.cn${trimmed}`
-          : `https://api.moeyao.cn/meting/${trimmed}`;
-      }
-      responseText = JSON.stringify({ url: finalUrl });
     }
   }
 
