@@ -83,39 +83,6 @@ async function proxyKuwoAudio(targetUrl: string, request: Request): Promise<Resp
   });
 }
 
-// 如果 url 指向上游自己的接口，递归解引用，直到拿到真正的音频地址或 302 Location
-async function resolveAudioUrl(urlStr: string, apiBaseUrl: string, depth = 0): Promise<string | null> {
-  if (depth > 3) return null;
-  try {
-    const parsed = new URL(urlStr);
-    const isUpstreamApi = parsed.hostname === new URL(apiBaseUrl).hostname;
-    if (!isUpstreamApi) {
-      return urlStr;
-    }
-    const resp = await fetch(urlStr, {
-      headers: { "User-Agent": "Meting/1.5.0", "Accept": "application/json" },
-      redirect: "manual",
-    });
-    const location = resp.headers.get("Location");
-    if (location) return location;
-    const text = await resp.text();
-    const trimmed = text.trim();
-    if (trimmed.startsWith("http")) return trimmed;
-    if (trimmed.startsWith("{")) {
-      try {
-        const json = JSON.parse(trimmed);
-        if (json.url) {
-          if (json.url === urlStr) return null;
-          return await resolveAudioUrl(json.url, apiBaseUrl, depth + 1);
-        }
-      } catch {}
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise: Promise<any>) => void, apiBaseUrl: string = DEFAULT_API_BASE_URL): Promise<Response> {
   const cache = caches.default;
 
@@ -161,7 +128,6 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     "song": "song",
   };
 
-  // met.liiiu.cn 只支持 netease / tencent，其余源降级到 netease
   const sourceMap: Record<string, string> = {
     "netease": "netease",
     "tencent": "tencent",
@@ -217,32 +183,37 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   headers.set("X-Cache-Status", "MISS");
   headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
 
-  // ---- type=url：解引用，直到拿到真正的音频地址 ----
+  // ---- type=url：跟随重定向，从 Response.url 拿最终 CDN 直链 ----
   if (metingType === "url" && upstream.status === 200) {
-    let finalUrl: string | null = null;
     const trimmed = responseText.trim();
+    let finalUrl: string | null = null;
 
     if (trimmed.startsWith("{")) {
       try {
         const json = JSON.parse(trimmed);
         if (json.url) {
-          finalUrl = await resolveAudioUrl(json.url, apiBaseUrl);
+          const followResp = await fetch(json.url, {
+            headers: { "User-Agent": "Meting/1.5.0" },
+            redirect: "follow",
+          });
+          finalUrl = followResp.url || json.url;
         }
       } catch {}
     } else if (trimmed.startsWith("http")) {
-      finalUrl = await resolveAudioUrl(trimmed, apiBaseUrl);
+      const followResp = await fetch(trimmed, {
+        headers: { "User-Agent": "Meting/1.5.0" },
+        redirect: "follow",
+      });
+      finalUrl = followResp.url || trimmed;
     } else if (trimmed && !trimmed.startsWith("[")) {
-      // 纯文本相对路径，补全前缀后尝试
-      const prefixed = trimmed.startsWith("/")
+      // 纯文本相对路径，补全前缀
+      finalUrl = trimmed.startsWith("/")
         ? new URL(apiBaseUrl).origin + trimmed
         : apiBaseUrl.replace(/\/$/, "") + "/" + trimmed;
-      finalUrl = prefixed;
     }
 
     if (finalUrl) {
       responseText = JSON.stringify({ url: finalUrl });
-    } else if (trimmed.startsWith("{")) {
-      responseText = trimmed;
     } else {
       responseText = JSON.stringify({ url: trimmed });
     }
