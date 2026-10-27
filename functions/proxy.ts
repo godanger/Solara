@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = "https://api.moeyao.cn/meting/";
+const DEFAULT_API_BASE_URL = "https://music.duanjinglin.com/api";
 const KUWO_HOST_PATTERN = /(^|\.)kuwo\.cn$/i;
 const SAFE_RESPONSE_HEADERS = ["content-type", "cache-control", "accept-ranges", "content-length", "content-range", "etag", "last-modified", "expires"];
 
@@ -113,7 +113,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
 
   console.log(`[Cache MISS] Fetching from upstream: ${url.toString()}`);
 
-  // ---- Solara 参数 -> moeyao/Meting 参数映射 ----
+  // ---- Solara 参数 -> duanjinglin 参数映射 ----
   const solaraTypes = url.searchParams.get("types") || "";
   const solaraSource = url.searchParams.get("source") || "netease";
   const solaraName = url.searchParams.get("name");
@@ -122,12 +122,13 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   const typeMap: Record<string, string> = {
     "search": "search",
     "url": "url",
-    "pic": "cover",
+    "pic": "pic",
     "lyric": "lrc",
     "playlist": "playlist",
-    "song": "single",
+    "song": "song",
   };
 
+  // duanjinglin 只支持 netease / tencent，其余源降级到 netease
   const sourceMap: Record<string, string> = {
     "netease": "netease",
     "tencent": "tencent",
@@ -140,6 +141,17 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     return new Response("Missing search keyword", { status: 400 });
   }
 
+  // tencent 源不支持 search，直接拦截
+  if (metingServer === "tencent" && metingType === "search") {
+    return new Response(JSON.stringify({ error: "tencent source does not support search" }), {
+      status: 400,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+      },
+    });
+  }
+
   const apiUrl = new URL(apiBaseUrl);
   apiUrl.searchParams.set("server", metingServer);
   apiUrl.searchParams.set("type", metingType);
@@ -148,49 +160,14 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   const count = url.searchParams.get("count");
   const pages = url.searchParams.get("pages");
   const br = url.searchParams.get("br");
+  const size = url.searchParams.get("size");
   if (count) apiUrl.searchParams.set("count", count);
   if (pages) apiUrl.searchParams.set("pages", pages);
   if (br) apiUrl.searchParams.set("br", br);
+  if (size) apiUrl.searchParams.set("size", size);
 
   if (!apiUrl.searchParams.has("type")) {
     return new Response("Missing types", { status: 400 });
-  }
-
-  // ---- type=url：不跟随重定向，直接提取 302 Location 作为完整播放地址 ----
-  if (metingType === "url") {
-    const urlUpstream = await fetch(apiUrl.toString(), {
-      headers: {
-        "User-Agent": "Meting/1.5.0",
-        "Accept": "application/json",
-      },
-      redirect: "manual",
-    });
-
-    const location = urlUpstream.headers.get("Location");
-    let payload: string;
-
-    if (location) {
-      payload = JSON.stringify({ url: location });
-    } else {
-      const bodyText = await urlUpstream.text();
-      const trimmed = bodyText.trim();
-      if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-        payload = JSON.stringify({ url: trimmed });
-      } else {
-        payload = bodyText;
-      }
-    }
-
-    return new Response(payload, {
-      status: 200,
-      headers: {
-        "Content-Type": "application/json; charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
-        "X-Cache-Status": "MISS",
-        "Access-Control-Expose-Headers": "X-Cache-Status",
-        "Cache-Control": "no-store, no-cache, must-revalidate",
-      },
-    });
   }
 
   const upstream = await fetch(apiUrl.toString(), {
@@ -208,30 +185,14 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   headers.set("X-Cache-Status", "MISS");
   headers.set("Access-Control-Expose-Headers", "X-Cache-Status");
 
-  // 清理 PHP 弃用警告（可能出现在 JSON 之前的 HTML 标签）
-  if (responseText.includes("<b>Deprecated</b>") || responseText.includes("<br />")) {
-    const firstJsonChar = responseText.search(/[\[{]/);
-    if (firstJsonChar > 0) {
-      responseText = responseText.slice(firstJsonChar);
-    }
-  }
-
-  // ---- 雷达歌单格式转换：moeyao 扁平数组 -> 网易云 {playlist:{tracks:[...]}} ----
-  // moeyao 的 playlist 返回项只有 name/artist/cover，真实歌曲 ID 藏在 cover 的查询参数里
+  // ---- 雷达歌单格式转换：duanjinglin 扁平数组 -> 网易云 {playlist:{tracks:[...]}} ----
   if (metingType === "playlist" && upstream.status === 200) {
     try {
       const parsed = JSON.parse(responseText);
       if (Array.isArray(parsed)) {
         const tracks = parsed.map((item: any, idx: number) => {
           let realId = item.id || item.songmid || "";
-          // 优先从 cover 字段解析 id
-          if (!realId && typeof item.cover === "string") {
-            try {
-              const u = new URL(item.cover);
-              realId = u.searchParams.get("id") || "";
-            } catch {}
-          }
-          // 兜底：从 url / lrc 字段解析
+          // duanjinglin 的 playlist 项里 url 是完整链接，从 url 解析 id
           if (!realId && typeof item.url === "string") {
             try {
               const u = new URL(item.url);
@@ -250,7 +211,7 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
             ar: [{ name: item.artist || item.author || "未知艺术家" }],
             al: {
               name: item.album || "",
-              picUrl: item.cover || item.pic || "",
+              picUrl: item.pic || item.cover || "",
               pic_str: item.pic_id || "",
             },
           };
