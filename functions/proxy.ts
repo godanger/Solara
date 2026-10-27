@@ -217,12 +217,21 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
   }
 
   // ---- 雷达歌单格式转换：moeyao 扁平数组 -> 网易云 {playlist:{tracks:[...]}} ----
+  // moeyao 的 playlist 返回项只有 name/artist/cover，真实歌曲 ID 藏在 cover 的查询参数里
   if (metingType === "playlist" && upstream.status === 200) {
     try {
       const parsed = JSON.parse(responseText);
       if (Array.isArray(parsed)) {
         const tracks = parsed.map((item: any, idx: number) => {
           let realId = item.id || item.songmid || "";
+          // 优先从 cover 字段解析 id
+          if (!realId && typeof item.cover === "string") {
+            try {
+              const u = new URL(item.cover);
+              realId = u.searchParams.get("id") || "";
+            } catch {}
+          }
+          // 兜底：从 url / lrc 字段解析
           if (!realId && typeof item.url === "string") {
             try {
               const u = new URL(item.url);
