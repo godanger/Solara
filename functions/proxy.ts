@@ -179,15 +179,17 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     }
   }
 
-  // ---- type=url：moeyao 返回的是纯文本文件名，需要补全为完整 URL ----
+  // ---- type=url：moeyao 返回纯文本相对路径，补全为完整 URL ----
   if (metingType === "url" && upstream.status === 200) {
     const trimmed = responseText.trim();
-    const isPlainPath = trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("http");
-    if (isPlainPath) {
-      // moeyao 的 url 接口返回的是相对路径文件名（如 035d/555d/...mp3）
-      // 实际音频 CDN 前缀需要根据其接口行为确认；先原样返回，让前端 audio.js 的候选地址逻辑处理
-      // 如果前端直接播放失败，可在此处拼接真实 CDN 前缀
-      responseText = JSON.stringify({ url: trimmed });
+    // 如果返回的是纯文本路径（不是 JSON、不是完整 URL），尝试补全
+    if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("http")) {
+      // moeyao 的 url 接口可能返回相对路径如 035d/555d/...mp3
+      // 先尝试拼接 api.moeyao.cn 域名；如果播放失败，需要根据实际 CDN 前缀调整
+      const fullUrl = trimmed.startsWith("/")
+        ? `https://api.moeyao.cn${trimmed}`
+        : `https://api.moeyao.cn/meting/${trimmed}`;
+      responseText = JSON.stringify({ url: fullUrl });
     }
   }
 
@@ -196,16 +198,32 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     try {
       const parsed = JSON.parse(responseText);
       if (Array.isArray(parsed)) {
-        const tracks = parsed.map((item: any, idx: number) => ({
-          id: item.id || item.songmid || `radar_${idx}`,
-          name: item.name || item.title || "未知歌曲",
-          ar: [{ name: item.artist || item.author || "未知艺术家" }],
-          al: {
-            name: item.album || "",
-            picUrl: item.cover || item.pic || "",
-            pic_str: item.pic_id || "",
-          },
-        }));
+        const tracks = parsed.map((item: any, idx: number) => {
+          // 从 url 字段里解析真实歌曲 ID（moeyao 的 id 藏在 url 查询参数中）
+          let realId = item.id || item.songmid || "";
+          if (!realId && typeof item.url === "string") {
+            try {
+              const u = new URL(item.url);
+              realId = u.searchParams.get("id") || "";
+            } catch {}
+          }
+          if (!realId && typeof item.lrc === "string") {
+            try {
+              const u = new URL(item.lrc);
+              realId = u.searchParams.get("id") || "";
+            } catch {}
+          }
+          return {
+            id: realId || `radar_${idx}`,
+            name: item.name || item.title || "未知歌曲",
+            ar: [{ name: item.artist || item.author || "未知艺术家" }],
+            al: {
+              name: item.album || "",
+              picUrl: item.cover || item.pic || "",
+              pic_str: item.pic_id || "",
+            },
+          };
+        });
         responseText = JSON.stringify({ playlist: { tracks } });
       }
     } catch (e) {
