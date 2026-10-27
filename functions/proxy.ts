@@ -193,6 +193,30 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     });
   }
 
+  // ---- type=lrc：纯文本 LRC 包装成前端期望的 JSON ----
+  if (metingType === "lrc") {
+    const lyricUpstream = await fetch(apiUrl.toString(), {
+      headers: {
+        "User-Agent": "Meting/1.5.0",
+        "Accept": "application/json",
+      },
+    });
+    const lyricText = (await lyricUpstream.text()).trim();
+    const payload = lyricText.startsWith("{")
+      ? lyricText
+      : JSON.stringify({ lyric: lyricText, tlyric: "" });
+    return new Response(payload, {
+      status: 200,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Access-Control-Allow-Origin": "*",
+        "X-Cache-Status": "MISS",
+        "Access-Control-Expose-Headers": "X-Cache-Status",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+      },
+    });
+  }
+
   const upstream = await fetch(apiUrl.toString(), {
     headers: {
       "User-Agent": "Meting/1.5.0",
