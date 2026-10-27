@@ -179,17 +179,17 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
     }
   }
 
-  // ---- type=url：moeyao 返回纯文本相对路径，补全为完整 URL ----
+  // ---- type=url：无论上游返回完整 URL 还是相对路径，统一包装成 {"url": "..."} ----
   if (metingType === "url" && upstream.status === 200) {
     const trimmed = responseText.trim();
-    // 如果返回的是纯文本路径（不是 JSON、不是完整 URL），尝试补全
-    if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[") && !trimmed.startsWith("http")) {
-      // moeyao 的 url 接口可能返回相对路径如 035d/555d/...mp3
-      // 先尝试拼接 api.moeyao.cn 域名；如果播放失败，需要根据实际 CDN 前缀调整
-      const fullUrl = trimmed.startsWith("/")
-        ? `https://api.moeyao.cn${trimmed}`
-        : `https://api.moeyao.cn/meting/${trimmed}`;
-      responseText = JSON.stringify({ url: fullUrl });
+    if (trimmed && !trimmed.startsWith("{") && !trimmed.startsWith("[")) {
+      let finalUrl = trimmed;
+      if (!trimmed.startsWith("http")) {
+        finalUrl = trimmed.startsWith("/")
+          ? `https://api.moeyao.cn${trimmed}`
+          : `https://api.moeyao.cn/meting/${trimmed}`;
+      }
+      responseText = JSON.stringify({ url: finalUrl });
     }
   }
 
@@ -199,7 +199,6 @@ async function proxyApiRequest(url: URL, request: Request, waitUntil?: (promise:
       const parsed = JSON.parse(responseText);
       if (Array.isArray(parsed)) {
         const tracks = parsed.map((item: any, idx: number) => {
-          // 从 url 字段里解析真实歌曲 ID（moeyao 的 id 藏在 url 查询参数中）
           let realId = item.id || item.songmid || "";
           if (!realId && typeof item.url === "string") {
             try {
